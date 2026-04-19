@@ -2,11 +2,14 @@ import streamlit as st
 import numpy as np
 import plotly.graph_objects as go
 import time
+from scipy.linalg import lu_factor, lu_solve
+from suspension import render_suspension_tab
+from telemetry import render_telemetry_tab
 
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="GT Racing Line Simulator",
-    page_icon="🏎",
+    page_icon="",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -92,18 +95,6 @@ h1, h2, h3 {
     letter-spacing: 1px;
 }
 
-.status-ready {
-    background: #1a3a1a;
-    border: 1px solid #44ff44;
-    color: #44ff44;
-}
-
-.status-running {
-    background: #3a2a00;
-    border: 1px solid #ff8800;
-    color: #ff8800;
-}
-
 .sidebar-header {
     font-family: 'Orbitron', monospace;
     font-size: 0.75rem;
@@ -164,14 +155,11 @@ div[data-testid="stSelectbox"] label {
 
 # ── Preset Track Data ─────────────────────────────────────────────────────────
 def parse_track_csv(source):
-    """Parse track CSV from a filepath string or file-like object.
-    Expected columns: x_m, y_m, w_tr_right_m, w_tr_left_m"""
     import csv, io
     xs, ys, wr_list, wl_list = [], [], [], []
     if isinstance(source, str):
         f = open(source)
     else:
-        # Streamlit UploadedFile — read bytes and decode
         raw = source.read()
         if isinstance(raw, bytes):
             raw = raw.decode("utf-8")
@@ -184,7 +172,7 @@ def parse_track_csv(source):
             xs.append(float(row[0])); ys.append(float(row[1]))
             wr_list.append(float(row[2])); wl_list.append(float(row[3]))
         except ValueError:
-            continue  # skip header rows with non-numeric data
+            continue
     if isinstance(source, str):
         f.close()
     x, y = np.array(xs), np.array(ys)
@@ -198,8 +186,7 @@ def parse_track_csv(source):
     return outer, inner, center
 
 def get_track(name, uploaded_csv=None):
-    """Returns (outer_wall, inner_wall, center) as arrays of (x, y) points"""
-    if name == "📂 Upload CSV..." and uploaded_csv is not None:
+    if name == "Upload CSV..." and uploaded_csv is not None:
         return parse_track_csv(uploaded_csv)
     elif name == "Monza":
         return parse_track_csv("Monza.csv")
@@ -245,10 +232,7 @@ def build_Q(n):
     Q[-1, -1] = 2; Q[-1, -2] = -1
     return Q
 
-# ── Compute track curvature at each point ─────────────────────────────────────
 def compute_track_curvature(center):
-    """Returns signed curvature at each point along the center line.
-    Positive = left turn, Negative = right turn (from car's perspective)."""
     n = len(center)
     curvature = np.zeros(n)
     for i in range(n):
@@ -257,21 +241,20 @@ def compute_track_curvature(center):
         p2 = center[(i + 1) % n]
         v1 = p1 - p0
         v2 = p2 - p1
-        # signed cross product: positive = left bend, negative = right bend
         cross = v1[0] * v2[1] - v1[1] * v2[0]
         denom = (np.linalg.norm(v1) * np.linalg.norm(v2)) + 1e-9
         curvature[i] = cross / denom
     return curvature
 
-# ── Compute racing line from alpha ────────────────────────────────────────────
 def alpha_to_line(alpha, outer, inner):
     return outer * alpha[:, None] + inner * (1 - alpha[:, None])
 
-# ── Compute speed profile ─────────────────────────────────────────────────────
 def compute_speed_profile(line, mu, cl, cd, rho=1.225, A=2.0, m=1400):
     n = len(line)
     speeds = np.zeros(n)
     g = 9.81
+    F_engine = 10000  # Engine thrust in Newtons (determines top speed)
+    
     for i in range(n):
         p1 = line[i]
         p2 = line[(i + 1) % n]
@@ -279,17 +262,33 @@ def compute_speed_profile(line, mu, cl, cd, rho=1.225, A=2.0, m=1400):
         v1 = p2 - p1
         v2 = p1 - p0
         cross = abs(v1[0] * v2[1] - v1[1] * v2[0])
-        denom = (np.linalg.norm(v1) * np.linalg.norm(v2)) + 1e-9
-        curvature = cross / (denom + 1e-9)
+        denom_cross = (np.linalg.norm(v1) * np.linalg.norm(v2)) + 1e-9
+        curvature = cross / (denom_cross + 1e-9)
         r = 1.0 / (curvature + 1e-6)
-        # downforce increases grip
-        F_down = 0.5 * rho * cl * A
-        N = m * g + F_down
-        v_max = np.sqrt(mu * g * r * (1 + F_down / (m * g)))
-        speeds[i] = min(v_max, 90)  # cap at 90 m/s (~320 km/h)
+        
+        # 1. Top speed limited by aerodynamic drag
+        # F_drag = 0.5 * rho * cd * A * v^2
+        # At top speed, F_engine = F_drag
+        v_top = np.sqrt(F_engine / (0.5 * rho * cd * A + 1e-6))
+        
+        # 2. Cornering limited by tyre grip and downforce
+        # Centrifugal force: m * v^2 / r
+        # Grip limit: mu * Normal_Force = mu * (m * g + F_down)
+        # F_down = 0.5 * rho * cl * A * v^2
+        # Equating them: v^2 * (m/r - 0.5 * mu * rho * cl * A) = mu * m * g
+        denom_grip = (m / r) - (0.5 * mu * rho * cl * A)
+        
+        if denom_grip > 0:
+            v_corner = np.sqrt((mu * m * g) / denom_grip)
+        else:
+            # Massive downforce allows infinite grip (capped by engine)
+            v_corner = float('inf')
+            
+        # The car can only go as fast as the lowest limit
+        speeds[i] = min(v_corner, v_top)
+        
     return speeds
 
-# ── Compute lateral G ─────────────────────────────────────────────────────────
 def compute_lateral_g(line, speeds):
     n = len(line)
     lat_g = np.zeros(n)
@@ -307,11 +306,8 @@ def compute_lateral_g(line, speeds):
         lat_g[i] = (speeds[i] ** 2) / (r * g)
     return lat_g
 
-# ── Plot track ────────────────────────────────────────────────────────────────
 def plot_track(outer, inner, center, racing_line=None, iteration=None, ghost_lines=None):
     fig = go.Figure()
-
-    # Track surface fill
     fig.add_trace(go.Scatter(
         x=np.append(outer[:, 0], outer[0, 0]),
         y=np.append(outer[:, 1], outer[0, 1]),
@@ -330,19 +326,14 @@ def plot_track(outer, inner, center, racing_line=None, iteration=None, ghost_lin
         name='Inner',
         showlegend=False,
     ))
-
-    # Outer wall
     fig.add_trace(go.Scatter(
         x=np.append(outer[:, 0], outer[0, 0]),
         y=np.append(outer[:, 1], outer[0, 1]),
         mode='lines',
         line=dict(color='rgba(255,255,255,0.27)', width=2),
         name='Outer Wall',
-
         showlegend=False,
     ))
-
-    # Inner wall
     fig.add_trace(go.Scatter(
         x=np.append(inner[:, 0], inner[0, 0]),
         y=np.append(inner[:, 1], inner[0, 1]),
@@ -351,8 +342,6 @@ def plot_track(outer, inner, center, racing_line=None, iteration=None, ghost_lin
         name='Inner Wall',
         showlegend=False,
     ))
-
-    # Center line (dashed)
     fig.add_trace(go.Scatter(
         x=np.append(center[:, 0], center[0, 0]),
         y=np.append(center[:, 1], center[0, 1]),
@@ -361,18 +350,12 @@ def plot_track(outer, inner, center, racing_line=None, iteration=None, ghost_lin
         name='Center Line',
         showlegend=False,
     ))
-
-    # Ghost lines — past iterations fading out
-    # ghost_lines is a list of (line_array, iter_num), oldest first
     if ghost_lines:
         n_ghosts = len(ghost_lines)
         for idx, (ghost, ghost_iter) in enumerate(ghost_lines):
-            # fade: oldest ghost is nearly invisible, newest ghost is more visible
-            # opacity ramps from 0.04 (oldest) to 0.30 (most recent ghost)
-            t = (idx + 1) / n_ghosts  # 0..1, oldest=low, newest=high
+            t = (idx + 1) / n_ghosts
             opacity = 0.04 + t * 0.26
-            width = 0.8 + t * 1.2  # thin → slightly thicker as we approach current
-            # color shifts slightly: older = more blue-ish, newer = more orange
+            width = 0.8 + t * 1.2
             r = int(180 + t * 75)
             g_ch = int(60 + t * 68)
             b_ch = int(100 - t * 80)
@@ -385,8 +368,6 @@ def plot_track(outer, inner, center, racing_line=None, iteration=None, ghost_lin
                 name=f'Iter {ghost_iter}',
                 showlegend=False,
             ))
-
-    # Current racing line (bright red, on top)
     if racing_line is not None:
         fig.add_trace(go.Scatter(
             x=np.append(racing_line[:, 0], racing_line[0, 0]),
@@ -395,8 +376,7 @@ def plot_track(outer, inner, center, racing_line=None, iteration=None, ghost_lin
             line=dict(color='#ff4444', width=3),
             name=f'Racing Line (iter {iteration})' if iteration else 'Racing Line',
         ))
-
-    title_text = f"🏎  Track Layout" + (f" — Iteration {iteration}" if iteration else "")
+    title_text = f" Track Layout" + (f" — Iteration {iteration}" if iteration else "")
     fig.update_layout(
         title=dict(text=title_text, font=dict(family='Orbitron', size=14, color='#ff8800')),
         paper_bgcolor='#0a0a0f',
@@ -410,13 +390,12 @@ def plot_track(outer, inner, center, racing_line=None, iteration=None, ghost_lin
     )
     return fig
 
-# ── Plot speed profile ────────────────────────────────────────────────────────
 def plot_speed(speeds):
     n = len(speeds)
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=list(range(n)),
-        y=speeds * 3.6,  # m/s to km/h
+        y=speeds * 3.6,
         mode='lines',
         fill='tozeroy',
         fillcolor='rgba(255,68,68,0.1)',
@@ -435,7 +414,6 @@ def plot_speed(speeds):
     )
     return fig
 
-# ── Plot lateral G ────────────────────────────────────────────────────────────
 def plot_lat_g(lat_g, mu):
     n = len(lat_g)
     fig = go.Figure()
@@ -464,51 +442,48 @@ def plot_lat_g(lat_g, mu):
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown('<div class="main-title" style="font-size:1.2rem;">⚙ SETUP</div>', unsafe_allow_html=True)
-
-    st.markdown('<div class="sidebar-header">🏁 Track</div>', unsafe_allow_html=True)
-    track_name = st.selectbox("Select Track", ["Monza", "Spa-Francorchamps", "Suzuka", "Silverstone", "📂 Upload CSV..."])
+    st.markdown('<div class="main-title" style="font-size:1.2rem;">SETUP</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sidebar-header">Track</div>', unsafe_allow_html=True)
+    track_name = st.selectbox("Select Track", ["Monza", "Spa-Francorchamps", "Suzuka", "Silverstone", "Upload CSV..."])
 
     uploaded_csv = None
-    if track_name == "📂 Upload CSV...":
+    if track_name == "Upload CSV...":
         uploaded_csv = st.file_uploader("Drop track CSV here", type=["csv"], label_visibility="collapsed")
         if uploaded_csv is None:
             st.caption("CSV format: x_m, y_m, w_tr_right_m, w_tr_left_m")
 
-    st.markdown('<div class="sidebar-header">💨 Aerodynamics</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sidebar-header">Aerodynamics</div>', unsafe_allow_html=True)
     cl = st.slider("Downforce Coefficient (CL)", 0.5, 4.0, 2.5, 0.1)
     cd = st.slider("Drag Coefficient (CD)", 0.5, 2.0, 1.0, 0.1)
 
-    st.markdown('<div class="sidebar-header">🔵 Tyres</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sidebar-header">Tyres</div>', unsafe_allow_html=True)
     mu = st.slider("Friction Coefficient (μ)", 0.8, 2.0, 1.4, 0.05)
 
-    st.markdown('<div class="sidebar-header">⚙ Suspension</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sidebar-header">Suspension</div>', unsafe_allow_html=True)
     k = st.slider("Spring Stiffness (k)", 10000, 80000, 40000, 5000)
     c = st.slider("Damping (c)", 1000, 8000, 3000, 500)
 
-    st.markdown('<div class="sidebar-header">🔄 Optimizer</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sidebar-header">Optimizer</div>', unsafe_allow_html=True)
     n_iter = st.slider("Iterations", 5, 100, 30, 5)
     lr = st.slider("Learning Rate", 0.01, 0.5, 0.1, 0.01)
 
     st.markdown("<br>", unsafe_allow_html=True)
-    run_btn = st.button("▶  RUN OPTIMIZER")
-    reset_btn = st.button("↺  RESET")
+    run_btn = st.button(" RUN ITERATIVE")
+    run_exact_btn = st.button(" EXACT SOLVE (LU)")
+    reset_btn = st.button(" RESET")
 
 # ── Main Layout ───────────────────────────────────────────────────────────────
 st.markdown('<div class="main-title">GT RACING LINE SIMULATOR</div>', unsafe_allow_html=True)
 st.markdown('<div class="subtitle">Linear Algebra · Physics Simulation · GT Motorsport</div>', unsafe_allow_html=True)
 
-# Load track — handle upload mode
-if track_name == "📂 Upload CSV..." and uploaded_csv is None:
-    st.info("⬆ Drop a track CSV in the sidebar to get started — format: `x_m, y_m, w_tr_right_m, w_tr_left_m`")
+if track_name == "Upload CSV..." and uploaded_csv is None:
+    st.info("Drop a track CSV in the sidebar to get started — format: `x_m, y_m, w_tr_right_m, w_tr_left_m`")
     st.stop()
 
-# use uploaded filename as unique track ID so reset triggers on new file
-track_id = uploaded_csv.name if (track_name == "📂 Upload CSV..." and uploaded_csv) else track_name
+track_id = uploaded_csv.name if (track_name == "Upload CSV..." and uploaded_csv) else track_name
 outer, inner, center = get_track(track_name, uploaded_csv)
 n_seg = len(center)
 
-# Init alpha — reset if track changed or explicit reset
 if 'alpha' not in st.session_state or reset_btn or st.session_state.get('track_name') != track_id:
     st.session_state.alpha = np.full(n_seg, 0.5)
     st.session_state.iteration = 0
@@ -516,12 +491,11 @@ if 'alpha' not in st.session_state or reset_btn or st.session_state.get('track_n
     st.session_state.cost_history = []
     st.session_state.ghost_lines = []
     st.session_state.track_name = track_id
-    st.session_state.optimized = False  # flag: has optimizer run at least once?
+    st.session_state.optimized = False
 
 alpha = st.session_state.alpha
 optimized = st.session_state.get('optimized', False)
 
-# only compute metrics if we have an actual racing line to show
 if optimized:
     racing_line = alpha_to_line(alpha, outer, inner)
     speeds = compute_speed_profile(racing_line, mu, cl, cd)
@@ -531,145 +505,155 @@ else:
     speeds = np.zeros(n_seg)
     lat_g = np.zeros(n_seg)
 
-# ── Top metrics row ───────────────────────────────────────────────────────────
+# Create tabs
+tab_line, tab_susp, tab_pca = st.tabs(["Racing Line Solver", "Suspension Dynamics (Eigenvalues)", "Telemetry PCA (SVD)"])
 
-col1, col2, col3, col4, col5 = st.columns(5)
-with col1:
-    val = f"{speeds.max()*3.6:.0f}" if optimized else "—"
-    st.markdown(f"""<div class="metric-card">
-        <div class="metric-label">Max Speed</div>
-        <div class="metric-value">{val}<span class="metric-unit">{"km/h" if optimized else ""}</span></div>
-    </div>""", unsafe_allow_html=True)
-with col2:
-    val = f"{speeds.min()*3.6:.0f}" if optimized else "—"
-    st.markdown(f"""<div class="metric-card">
-        <div class="metric-label">Min Speed</div>
-        <div class="metric-value">{val}<span class="metric-unit">{"km/h" if optimized else ""}</span></div>
-    </div>""", unsafe_allow_html=True)
-with col3:
-    val = f"{lat_g.max():.2f}" if optimized else "—"
-    st.markdown(f"""<div class="metric-card">
-        <div class="metric-label">Max Lateral G</div>
-        <div class="metric-value">{val}<span class="metric-unit">{"G" if optimized else ""}</span></div>
-    </div>""", unsafe_allow_html=True)
-with col4:
-    st.markdown(f"""<div class="metric-card">
-        <div class="metric-label">Segments</div>
-        <div class="metric-value">{n_seg}<span class="metric-unit">pts</span></div>
-    </div>""", unsafe_allow_html=True)
-with col5:
-    st.markdown(f"""<div class="metric-card">
-        <div class="metric-label">Iteration</div>
-        <div class="metric-value">{st.session_state.iteration}</div>
-    </div>""", unsafe_allow_html=True)
+with tab_line:
+    metrics_placeholder = st.empty()
+    st.markdown("<hr class='section-divider'>", unsafe_allow_html=True)
 
-st.markdown("<hr class='section-divider'>", unsafe_allow_html=True)
+    col_track, col_graphs = st.columns([1.5, 1])
+    track_placeholder = col_track.empty()
+    speed_placeholder = col_graphs.empty()
+    g_placeholder = col_graphs.empty()
+    iter_placeholder = st.empty()
 
-# ── Main plots ────────────────────────────────────────────────────────────────
-col_track, col_graphs = st.columns([1.5, 1])
+    def render(alpha, iteration, ghost_lines=None, show_line=True):
+        rl = alpha_to_line(alpha, outer, inner) if show_line else None
+        spd = compute_speed_profile(rl, mu, cl, cd) if show_line else np.zeros(n_seg)
+        lg = compute_lateral_g(rl, spd) if show_line else np.zeros(n_seg)
+        track_placeholder.plotly_chart(
+            plot_track(outer, inner, center, rl, iteration, ghost_lines=ghost_lines),
+            use_container_width=True
+        )
+        speed_placeholder.plotly_chart(plot_speed(spd), use_container_width=True)
+        g_placeholder.plotly_chart(plot_lat_g(lg, mu), use_container_width=True)
+        return rl, spd, lg
 
-track_placeholder = col_track.empty()
-speed_placeholder = col_graphs.empty()
-g_placeholder = col_graphs.empty()
-iter_placeholder = st.empty()
+    # Initial render if already optimized
+    if not run_btn and not run_exact_btn:
+        render(alpha, st.session_state.iteration, ghost_lines=st.session_state.get('ghost_lines', []), show_line=optimized)
 
-def render(alpha, iteration, ghost_lines=None, show_line=True):
-    rl = alpha_to_line(alpha, outer, inner) if show_line else None
-    spd = compute_speed_profile(rl, mu, cl, cd) if show_line else np.zeros(n_seg)
-    lg = compute_lateral_g(rl, spd) if show_line else np.zeros(n_seg)
-    track_placeholder.plotly_chart(
-        plot_track(outer, inner, center, rl, iteration, ghost_lines=ghost_lines),
-        use_container_width=True
-    )
-    speed_placeholder.plotly_chart(plot_speed(spd), use_container_width=True)
-    g_placeholder.plotly_chart(plot_lat_g(lg, mu), use_container_width=True)
-    return rl, spd, lg
+    # EXACT SOLVE
+    if run_exact_btn:
+        st.session_state.optimized = True
+        Q = build_Q(n_seg)
+        curv = compute_track_curvature(center)
+        curv_max = np.abs(curv).max() + 1e-9
+        curv_norm = curv / curv_max
+        corner_strength = 2.5
+        apex_target = 0.5 - 0.5 * curv_norm
+        apex_weight = np.abs(curv_norm)
 
-# Initial render — only show racing line if already optimized
-render(alpha, st.session_state.iteration,
-       ghost_lines=st.session_state.get('ghost_lines', []),
-       show_line=optimized)
+        # Build System: (2Q + diag(W)) alpha = W * apex_target
+        W = corner_strength * apex_weight
+        A = 2 * Q + np.diag(W)
+        B = W * apex_target
 
-# ── Optimizer loop ────────────────────────────────────────────────────────────
-if run_btn:
-    st.session_state.optimized = True
-    Q = build_Q(n_seg)
-    alpha = st.session_state.alpha.copy()
-    MAX_GHOSTS = 8
-    GHOST_EVERY = max(1, n_iter // 12)
+        start_time = time.time()
+        lu, piv = lu_factor(A)
+        alpha_exact = lu_solve((lu, piv), B)
+        solve_time = time.time() - start_time
 
-    # Compute signed curvature of the track center line
-    curv = compute_track_curvature(center)
+        alpha_exact = np.clip(alpha_exact, 0.05, 0.95)
+        st.session_state.alpha = alpha_exact
+        st.session_state.iteration = 1
+        st.session_state.cost_history = [float(alpha_exact @ Q @ alpha_exact)]
+        st.session_state.ghost_lines = []
 
-    # Normalize curvature to [-1, 1]
-    curv_max = np.abs(curv).max() + 1e-9
-    curv_norm = curv / curv_max  # positive = left bend, negative = right bend
-
-    # apex_target: where the line SHOULD be in corners
-    # In a left bend (curv > 0): go to inner wall (alpha → 0, i.e. inner)
-    # In a right bend (curv < 0): go to inner wall from right (alpha → 1, i.e. outer... wait)
-    # alpha=0 → inner wall, alpha=1 → outer wall
-    # For left corners: cut inside = alpha=0; for right corners: cut inside = alpha=1
-    # So: apex_target = 0.5 - 0.5 * sign(curv) * |curv_norm|
-    # On straights (curv≈0): target stays at 0.5
-    corner_strength = 2.5  # how aggressively to target apex vs smoothness
-    apex_target = 0.5 - 0.5 * curv_norm  # left bend → 0, right bend → 1, straight → 0.5
-
-    for i in range(n_iter):
-        # save ghost BEFORE updating alpha
-        if i % GHOST_EVERY == 0:
-            ghost_line = alpha_to_line(alpha, outer, inner)
-            st.session_state.ghost_lines.append((ghost_line.copy(), st.session_state.iteration))
-            if len(st.session_state.ghost_lines) > MAX_GHOSTS:
-                st.session_state.ghost_lines = st.session_state.ghost_lines[-MAX_GHOSTS:]
-
-        # Smoothness gradient from Q matrix
-        grad_smooth = 2 * Q @ alpha
-
-        # Apex-targeting gradient: pull alpha toward apex_target at corners
-        # Weight by |curvature| so straights are barely affected
-        apex_weight = np.abs(curv_norm)  # 0 on straights, 1 at sharpest corner
-        grad_apex = corner_strength * apex_weight * (alpha - apex_target)
-
-        grad = grad_smooth + grad_apex
-        alpha = alpha - lr * grad
-        alpha = np.clip(alpha, 0.05, 0.95)
-        st.session_state.iteration += 1
-        cost = float(alpha @ Q @ alpha)
-        st.session_state.cost_history.append(cost)
-
-        render(alpha, st.session_state.iteration, ghost_lines=st.session_state.ghost_lines)
         iter_placeholder.markdown(
-            f'<div class="iter-text">OPTIMIZING · ITERATION {st.session_state.iteration} · COST {cost:.4f}</div>',
+            f'<div class="iter-text" style="color:#44ff44;">EXACT SOLVE (LU) COMPLETE ({solve_time*1000:.1f} ms) · COST {st.session_state.cost_history[0]:.4f}</div>',
             unsafe_allow_html=True
         )
-        time.sleep(0.05)
+        alpha = alpha_exact
+        optimized = True
+        rl, speeds, lat_g = render(alpha, 1, show_line=True)
 
-    st.session_state.alpha = alpha
-    iter_placeholder.markdown(
-        f'<div class="iter-text" style="color:#44ff44;">✓ OPTIMIZATION COMPLETE · FINAL COST {cost:.4f}</div>',
-        unsafe_allow_html=True
-    )
+    # ITERATIVE SOLVE
+    if run_btn:
+        st.session_state.optimized = True
+        Q = build_Q(n_seg)
+        alpha = st.session_state.alpha.copy()
+        MAX_GHOSTS = 8
+        GHOST_EVERY = max(1, n_iter // 12)
+        curv = compute_track_curvature(center)
+        curv_max = np.abs(curv).max() + 1e-9
+        curv_norm = curv / curv_max
+        corner_strength = 2.5
+        apex_target = 0.5 - 0.5 * curv_norm
 
-# ── Cost history ──────────────────────────────────────────────────────────────
-if st.session_state.cost_history:
-    st.markdown("<hr class='section-divider'>", unsafe_allow_html=True)
-    st.markdown('<p style="font-family:Orbitron;font-size:0.8rem;color:#ff8800;letter-spacing:2px;">CONVERGENCE HISTORY</p>', unsafe_allow_html=True)
-    fig_cost = go.Figure()
-    fig_cost.add_trace(go.Scatter(
-        y=st.session_state.cost_history,
-        mode='lines+markers',
-        line=dict(color='#ffcc00', width=2),
-        marker=dict(color='#ff4444', size=4),
-        name='Cost αᵀQα',
-    ))
-    fig_cost.update_layout(
-        paper_bgcolor='#0a0a0f',
-        plot_bgcolor='#0a0a0f',
-        font=dict(family='Rajdhani', color='#aaa'),
-        xaxis=dict(showgrid=False, title='Iteration', color='#666'),
-        yaxis=dict(showgrid=True, gridcolor='rgba(255,255,255,0.07)', title='Cost', color='#666'),
-        margin=dict(l=40, r=20, t=20, b=40),
-        height=200,
-    )
-    st.plotly_chart(fig_cost, use_container_width=True)
+        for i in range(n_iter):
+            if i % GHOST_EVERY == 0:
+                ghost_line = alpha_to_line(alpha, outer, inner)
+                st.session_state.ghost_lines.append((ghost_line.copy(), st.session_state.iteration))
+                if len(st.session_state.ghost_lines) > MAX_GHOSTS:
+                    st.session_state.ghost_lines = st.session_state.ghost_lines[-MAX_GHOSTS:]
+            
+            grad_smooth = 2 * Q @ alpha
+            apex_weight = np.abs(curv_norm)
+            grad_apex = corner_strength * apex_weight * (alpha - apex_target)
+            grad = grad_smooth + grad_apex
+            alpha = alpha - lr * grad
+            alpha = np.clip(alpha, 0.05, 0.95)
+            st.session_state.iteration += 1
+            cost = float(alpha @ Q @ alpha)
+            st.session_state.cost_history.append(cost)
+
+            rl, speeds, lat_g = render(alpha, st.session_state.iteration, ghost_lines=st.session_state.ghost_lines)
+            iter_placeholder.markdown(
+                f'<div class="iter-text">OPTIMIZING · ITERATION {st.session_state.iteration} · COST {cost:.4f}</div>',
+                unsafe_allow_html=True
+            )
+            time.sleep(0.05)
+        st.session_state.alpha = alpha
+        optimized = True
+        iter_placeholder.markdown(
+            f'<div class="iter-text" style="color:#44ff44;">OPTIMIZATION COMPLETE · FINAL COST {cost:.4f}</div>',
+            unsafe_allow_html=True
+        )
+
+    # Render metrics dynamically using updated state
+    with metrics_placeholder.container():
+        col1, col2, col3, col4, col5 = st.columns(5)
+        with col1:
+            val = f"{speeds.max()*3.6:.0f}" if optimized else "—"
+            st.markdown(f"""<div class="metric-card"><div class="metric-label">Max Speed</div><div class="metric-value">{val}<span class="metric-unit">{"km/h" if optimized else ""}</span></div></div>""", unsafe_allow_html=True)
+        with col2:
+            val = f"{speeds.min()*3.6:.0f}" if optimized else "—"
+            st.markdown(f"""<div class="metric-card"><div class="metric-label">Min Speed</div><div class="metric-value">{val}<span class="metric-unit">{"km/h" if optimized else ""}</span></div></div>""", unsafe_allow_html=True)
+        with col3:
+            val = f"{lat_g.max():.2f}" if optimized else "—"
+            st.markdown(f"""<div class="metric-card"><div class="metric-label">Max Lateral G</div><div class="metric-value">{val}<span class="metric-unit">{"G" if optimized else ""}</span></div></div>""", unsafe_allow_html=True)
+        with col4:
+            st.markdown(f"""<div class="metric-card"><div class="metric-label">Segments</div><div class="metric-value">{n_seg}<span class="metric-unit">pts</span></div></div>""", unsafe_allow_html=True)
+        with col5:
+            st.markdown(f"""<div class="metric-card"><div class="metric-label">Iteration</div><div class="metric-value">{st.session_state.iteration}</div></div>""", unsafe_allow_html=True)
+
+    if st.session_state.cost_history:
+        st.markdown("<hr class='section-divider'>", unsafe_allow_html=True)
+        st.markdown('<p style="font-family:Orbitron;font-size:0.8rem;color:#ff8800;letter-spacing:2px;">CONVERGENCE HISTORY</p>', unsafe_allow_html=True)
+        fig_cost = go.Figure()
+        fig_cost.add_trace(go.Scatter(
+            y=st.session_state.cost_history,
+            mode='lines+markers',
+            line=dict(color='#ffcc00', width=2),
+            marker=dict(color='#ff4444', size=4),
+            name='Cost αᵀQα',
+        ))
+        fig_cost.update_layout(
+            paper_bgcolor='#0a0a0f',
+            plot_bgcolor='#0a0a0f',
+            font=dict(family='Rajdhani', color='#aaa'),
+            xaxis=dict(showgrid=False, title='Iteration', color='#666'),
+            yaxis=dict(showgrid=True, gridcolor='rgba(255,255,255,0.07)', title='Cost', color='#666'),
+            margin=dict(l=40, r=20, t=20, b=40),
+            height=200,
+        )
+        st.plotly_chart(fig_cost, use_container_width=True)
+
+with tab_susp:
+    render_suspension_tab(k, c)
+
+with tab_pca:
+    curv = compute_track_curvature(center)
+    render_telemetry_tab(speeds, lat_g, alpha, curv)

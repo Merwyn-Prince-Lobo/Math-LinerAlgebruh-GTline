@@ -1,4 +1,4 @@
-# 🏎 GT Racing Line Simulator
+# GT Racing Line Simulator
 
 > Streamlit app that computes the optimal racing line for GT circuits using quadratic optimization and physics-based constraints — with real-time animated convergence.
 
