@@ -111,5 +111,27 @@ gt-racing-line-simulator/
 - [Monza CSV data](https://github.com/TUMFTM/racetrack-database) — TUM Motorsport open racetrack dataset
 
 ---
+How to Run
+1. Clone the repository
+git clone <your-repo-link>
+cd Math-LinerAlgebruh-GTline
+2. Create and activate virtual environment
+python3 -m venv venv
+source venv/bin/activate
+3. Install dependencies
+pip install -r requirements.txt
 
+If requirements.txt is not available:
+
+pip install streamlit numpy scipy plotly
+4. Run the app
+streamlit run app.py
+5. Open in browser
+
+After running, the app will be available at:
+http://localhost:8501
+⚠️ Notes
+Make sure Python 3.8+ is installed
+Always activate the virtual environment before running
+If you get module errors, install missing packages using pip install <module>
 *Made as a math/physics project at PES University — linear algebra applied to motorsport.*
